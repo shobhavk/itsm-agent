@@ -1,0 +1,14 @@
+services:
+  itsm-quality-agent:
+    build: .
+    image: itsm-quality-agent:v1
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
