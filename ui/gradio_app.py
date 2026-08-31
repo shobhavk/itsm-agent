@@ -119,7 +119,7 @@ def _filter_table(full_df, category, min_score):
 def build_ui() -> gr.Blocks:
     from app.models.schemas import CATEGORIES
 
-    with gr.Blocks(css=CUSTOM_CSS, title="ITSM Quality Analysis Agent", theme=gr.themes.Soft(primary_hue="blue")) as demo:
+    with gr.Blocks(title="ITSM Quality Analysis Agent") as demo:
         gr.HTML(
             """
             <div id="header-banner">

@@ -1,15 +1,36 @@
-fastapi==0.115.0
+fastapi==0.141.1
 uvicorn[standard]==0.30.6
-gradio==4.44.0
-pydantic==2.9.2
-pydantic-settings==2.5.2
+gradio==6.26.0
+pydantic-settings>=2.10.1
 pandas==2.2.2
 openpyxl==3.1.5
-python-multipart==0.0.9
+python-multipart==0.0.18
 slowapi==0.1.9
 python-dotenv==1.0.1
 tenacity==8.5.0
-numpy==1.26.4
-scikit-learn==1.5.2
+numpy>=1.26.4
 chardet==5.2.0
-generative-ai-hub-sdk==3.5.0
+
+# --- SAP Generative AI Hub + multi-provider stack, pinned to match the
+# versions verified in the itsm-agent project (see requirements.txt there).
+# "generative-ai-hub-sdk" is deprecated/renamed to "sap-ai-sdk-gen" - the
+# import path gen_ai_hub.proxy.native.openai is unchanged. ---
+sap-ai-sdk-gen[all]
+sap-ai-sdk-core>=3.1.0
+httpx>=0.27.0
+h11>=0.16.0
+dacite>=1.8.1
+click>=8.1.7
+overloading==0.5.0
+packaging>=23.2
+pydantic~=2.12
+openai>=1.58.1
+google-genai~=1.60.0
+boto3>=1.40.61
+aiobotocore>=3.0.0
+langchain~=1.2.6
+langchain_google_genai~=4.2.0
+langchain-classic~=1.0.0
+langchain-community~=0.4.1
+langchain-openai~=1.1.0
+langchain-aws~=1.1.0
