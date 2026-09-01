@@ -6,6 +6,9 @@ Hybrid categorization pipeline, cheapest/most-reliable method first:
   2. Embedding similarity - semantic match against category description
                            vectors using EMBEDDING_MODEL_NAME. Catches
                            paraphrased/unstructured text keyword rules miss.
+                           Batched (see categorize_batch) - this is the
+                           fix for 429s on large uploads: previously one
+                           embedding call was made per ticket.
   3. LLM classification  - only invoked if the above are inconclusive
                            (keeps cost/latency down, and confines LLM
                            input to sanitized text with a guardrail prompt).
@@ -15,11 +18,13 @@ import logging
 
 import numpy as np
 
+from app.config import get_settings
 from app.models.schemas import CATEGORIES, CategoryResult
 from app.security import sanitize_for_llm
 from app.services.llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
+settings = get_settings()
 
 # Keyword rules: category -> indicative keywords/phrases (lowercase)
 KEYWORD_RULES: dict[str, list[str]] = {
@@ -128,3 +133,74 @@ class Categorizer:
             return CategoryResult(ticket_id=ticket_id, category=match[0], confidence=match[1], method="llm")
 
         return CategoryResult(ticket_id=ticket_id, category="Uncategorized", confidence=0.0, method="fallback")
+
+    def _batch_embedding_match(self, items: list[tuple[str, str]]) -> tuple[dict[str, CategoryResult], list[tuple[str, str]]]:
+        """Embeds many (ticket_id, text) pairs in chunked batch calls rather
+        than one call per ticket - the key fix for hitting rate limits on
+        large uploads. Returns (matched_results, still_unmatched_items)."""
+        self._ensure_category_vectors()
+        matched: dict[str, CategoryResult] = {}
+        if not self._category_vectors or not items:
+            return matched, items
+
+        still_unmatched: list[tuple[str, str]] = []
+        chunk_size = max(1, settings.EMBEDDING_BATCH_SIZE)
+
+        for start in range(0, len(items), chunk_size):
+            chunk = items[start:start + chunk_size]
+            texts = [text for _, text in chunk]
+            try:
+                vectors = self._llm.embed(texts)
+            except Exception as exc:
+                logger.info("Batch embedding call failed for %d tickets, leaving for LLM fallback: %s", len(chunk), exc)
+                still_unmatched.extend(chunk)
+                continue
+
+            for (ticket_id, _text), vec in zip(chunk, vectors):
+                vec = np.array(vec)
+                scored = {cat: _cosine_sim(vec, cvec) for cat, cvec in self._category_vectors.items()}
+                best_cat = max(scored, key=scored.get)
+                best_score = scored[best_cat]
+                if best_score >= self._threshold:
+                    matched[ticket_id] = CategoryResult(
+                        ticket_id=ticket_id, category=best_cat, confidence=min(best_score, 0.99), method="embedding"
+                    )
+                else:
+                    still_unmatched.append((ticket_id, _text))
+
+        return matched, still_unmatched
+
+    def categorize_batch(self, items: list[tuple[str, str]]) -> dict[str, CategoryResult]:
+        """Categorizes many tickets efficiently:
+          1. Keyword rules for everything (free, no API calls at all).
+          2. Batch-embed whatever's left (chunked API calls, not one per ticket).
+          3. LLM classify whatever's still unmatched, one at a time - by this
+             point the volume remaining should be a small fraction of the
+             original batch, and rate limiting/backoff in llm_client.py
+             covers this step.
+        Returns a dict keyed by ticket_id so callers can look up results in
+        whatever order they process tickets in.
+        """
+        results: dict[str, CategoryResult] = {}
+        needs_more: list[tuple[str, str]] = []
+
+        for ticket_id, text in items:
+            text = (text or "").strip()
+            if not text:
+                results[ticket_id] = CategoryResult(ticket_id=ticket_id, category="Uncategorized", confidence=0.0, method="fallback")
+                continue
+            if match := _keyword_match(text):
+                results[ticket_id] = CategoryResult(ticket_id=ticket_id, category=match[0], confidence=match[1], method="keyword_rule")
+                continue
+            needs_more.append((ticket_id, text))
+
+        embedding_matched, still_unmatched = self._batch_embedding_match(needs_more)
+        results.update(embedding_matched)
+
+        for ticket_id, text in still_unmatched:
+            if match := self._llm_match(text):
+                results[ticket_id] = CategoryResult(ticket_id=ticket_id, category=match[0], confidence=match[1], method="llm")
+            else:
+                results[ticket_id] = CategoryResult(ticket_id=ticket_id, category="Uncategorized", confidence=0.0, method="fallback")
+
+        return results

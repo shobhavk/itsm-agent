@@ -26,13 +26,25 @@ def _run_pipeline(df) -> AnalysisResponse:
     llm_client = get_llm_client()
     categorizer = Categorizer(llm_client, similarity_threshold=settings.SIMILARITY_THRESHOLD)
 
+    # Categorize in one batch pass rather than per-ticket: keyword rules run
+    # for free, then whatever's left gets embedded in chunked API calls
+    # instead of one call per ticket (see categorizer.categorize_batch and
+    # llm_client.py's module docstring for why this matters at 3k+ rows).
+    # ticket_id is guaranteed unique here - normalize_and_validate already
+    # rejected duplicates before this point.
+    batch_inputs = [
+        (rec.ticket_id, " ".join(filter(None, [rec.short_description, rec.description])).strip() or rec.worklog)
+        for rec in valid_records
+    ]
+    category_results = categorizer.categorize_batch(batch_inputs)
+
     results: list[AnalyzedTicket] = []
     category_counts: dict[str, int] = {}
     total_score = 0
 
     for rec in valid_records:
         combined_text = " ".join(filter(None, [rec.short_description, rec.description])).strip()
-        cat_result = categorizer.categorize(rec.ticket_id, combined_text or rec.worklog)
+        cat_result = category_results[rec.ticket_id]
         wl_result = score_worklog(rec.ticket_id, rec.worklog, combined_text, llm_client)
 
         category_counts[cat_result.category] = category_counts.get(cat_result.category, 0) + 1

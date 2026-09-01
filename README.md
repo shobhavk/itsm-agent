@@ -117,6 +117,46 @@ If the SDK call fails or isn't configured, `get_llm_client()` automatically
 falls back to `rule_based` rather than crashing the app — fail-safe, not
 fail-open.
 
+### Handling 429s on large uploads (3k+ rows)
+
+Both real providers now use OpenAI's **Responses API** (`.responses.create()`)
+rather than Chat Completions — confirmed supported by the `sap-ai-sdk-gen`
+proxy, which exposes `responses` alongside `chat`/`embeddings` with the same
+`model_name=` routing. That said, **switching API surface alone does not
+fix a rate-limit problem** — the actual fix is calling the API less and
+handling 429s properly when they happen:
+
+1. **Batched embedding calls** — this is the real cause of 429s at scale.
+   Previously, every ticket that fell through keyword rules triggered its
+   own embedding API call; at 3k rows with, say, 40% needing embedding
+   matching, that's 1,200+ separate calls. `categorizer.categorize_batch()`
+   now embeds many ticket texts per call (`EMBEDDING_BATCH_SIZE`, default
+   200), cutting that to roughly 6 calls instead of 1,200.
+2. **Client-side throttling** (`LLM_REQUESTS_PER_MINUTE`, default 60) —
+   paces calls proactively instead of firing as fast as possible and only
+   reacting after the API starts rejecting requests.
+3. **429-aware retry with backoff** (`LLM_RATE_LIMIT_MAX_RETRIES`, default
+   5) — honors the API's `Retry-After` header when present, falls back to
+   exponential backoff with jitter otherwise.
+
+I verified all three against a mock of the SAP proxy that simulates a 429
+with a `Retry-After` header and counts calls: a 50-ticket batch needing
+embedding classification produced exactly 2 embedding calls (not 50), and
+the simulated rate-limit response was retried after the exact `Retry-After`
+duration rather than crashing or using an arbitrary wait. I have **not**
+tested this against your real AI Core deployment's actual rate limits —
+those numbers (`LLM_REQUESTS_PER_MINUTE`, `EMBEDDING_BATCH_SIZE`) are
+reasonable defaults, not measured against your specific quota. If you still
+see 429s after this change, the AI Core dashboard should show which
+endpoint/quota is being hit, and these two settings are the knobs to tune.
+
+Per-ticket LLM classification/scoring calls (for tickets keyword rules and
+embeddings couldn't resolve) are *not* batched into a single prompt —
+reliably parsing N different classification results out of one completion
+is fragile — so they rely on throttling + retry instead. This is fine once
+the embedding-call volume is fixed, since that's what was driving the
+call count into the thousands.
+
 ## Security controls implemented
 
 - **API key auth** (`X-API-Key` header) on every analysis/export endpoint;
