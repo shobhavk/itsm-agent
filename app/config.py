@@ -51,20 +51,22 @@ class Settings(BaseSettings):
     # --- Categorization ---
     SIMILARITY_THRESHOLD: float = 0.35  # min cosine sim to accept embedding match
 
-    # --- Rate limiting / scale (added after hitting 429s on 3k-row batches) ---
-    # Client-side throttle applied before every classify/score/embed call,
-    # independent of retry behavior - keeps us under quota proactively
-    # instead of only reacting after a 429.
-    LLM_REQUESTS_PER_MINUTE: int = 60
-    # Max retry attempts specifically for 429/rate-limit errors, with
-    # exponential backoff honoring the API's Retry-After header when present.
+    # --- Async scale / 429 handling (LangChain-native, see llm_client.py) ---
+    # Max retry attempts on rate-limit errors, via LangChain's built-in
+    # Runnable.with_retry() - exponential backoff with jitter.
     LLM_RATE_LIMIT_MAX_RETRIES: int = 5
-    # How many ticket texts to embed in a single API call. The single
-    # biggest win for large batches: previously one embedding call was
-    # made PER TICKET that fell through keyword rules - at 3k rows with,
-    # say, 40% needing embedding matching, that's 1200+ separate calls.
-    # Batching them cuts that to ~1200/EMBEDDING_BATCH_SIZE calls.
+    # How many ticket texts get embedded per underlying API call
+    # (LangChain's OpenAIEmbeddings chunk_size). Previously one embedding
+    # call was made PER TICKET that fell through keyword rules - at 3k
+    # rows with, say, 40% needing embedding matching, that's 1200+
+    # separate calls. Batching cuts that to ~1200/EMBEDDING_BATCH_SIZE.
     EMBEDDING_BATCH_SIZE: int = 200
+    # Max concurrent in-flight LLM calls when classifying/scoring tickets
+    # that keyword rules and embeddings couldn't resolve, and the max
+    # concurrency LangGraph uses when batch-processing tickets through the
+    # pipeline graph. Bounds concurrency so a 3k-row upload doesn't fire
+    # 3000 simultaneous requests (the direct cause of 429s at scale).
+    LLM_MAX_CONCURRENCY: int = 10
 
 
 @lru_cache

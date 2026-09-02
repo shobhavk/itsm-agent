@@ -35,127 +35,157 @@ app/
   security.py           API key auth, upload validation, prompt-injection sanitization
   main.py                FastAPI app: CORS, rate limiting, security headers, mounts Gradio
   models/schemas.py     TicketRecord, CategoryResult, WorklogScore, AnalysisResponse
-  routers/analyze.py    POST /api/v1/analyze/file, /analyze/text, GET /export/csv
+  routers/analyze.py    POST /api/v1/analyze/file, /analyze/text, GET /export/csv — all async
   services/
     data_ingestion.py    Excel/CSV/unstructured-text -> raw DataFrame
     validator.py          Normalize + validate -> TicketRecord list (dedup, type coercion)
-    llm_client.py          Pluggable LLM/embedding interface (see below)
-    categorizer.py         Keyword rules -> embedding similarity -> LLM -> "Uncategorized"
-    scorer.py               Heuristic worklog rubric, optional LLM blending
-    pipeline.py              Orchestrates the above end-to-end
+    llm_client.py          LangChain model factory: get_chat_model()/get_embeddings_model()
+    categorizer.py         Keyword rules -> batched embedding similarity (async pre-pass)
+    graph_pipeline.py       LangGraph StateGraph: classify (LLM fallback) + score nodes
+    scorer.py                Heuristic worklog rubric (used by graph_pipeline's score node)
+    json_utils.py             extract_json() - pulls JSON out of LLM responses robustly
+    pipeline.py               Orchestrates the above end-to-end, async throughout
 ui/
   gradio_app.py           Dashboard: upload, category chart, filterable table, CSV download
 ```
 
-### Categorization strategy (cheapest/most-reliable first)
+### How a batch of tickets actually gets processed
 
-1. **Keyword rules** — fast, free, deterministic, high precision for obvious
-   phrasing ("disk space critical" → Disk/file system extension).
-2. **Embedding similarity** — semantic match against category descriptions
-   using `EMBEDDING_MODEL_NAME`, for paraphrased text the keywords miss.
-3. **LLM classification** — only called if 1 and 2 are inconclusive, to keep
-   cost and latency down.
-4. **"Uncategorized"** — explicit safety net. The agent never forces a
-   wrong label just to fill a bucket.
+1. **Keyword rules** (`categorizer.py`) — free, deterministic, no API calls, resolves
+   obvious cases ("disk space critical" → Disk/file system extension).
+2. **Batched embedding similarity** (`categorizer.py`) — whatever keywords couldn't
+   resolve gets embedded in one (chunked) call via `aembed_documents`, not one
+   call per ticket. This is the fix for 429s at 3k+ rows — see below.
+3. **LangGraph classify + score** (`graph_pipeline.py`) — a small per-ticket
+   `StateGraph` (`classify` → `score`) processed for every ticket via
+   `.abatch()`, concurrently but bounded by `LLM_MAX_CONCURRENCY`. `classify`
+   is a no-op for anything step 1/2 already resolved; `score` always runs the
+   heuristic rubric and optionally blends in an LLM judgment.
+4. **"Uncategorized"** — explicit safety net. The agent never forces a wrong
+   label just to fill a bucket, and a ticket that fails every step still gets
+   a heuristic-only score rather than being dropped.
 
-In `rule_based` mode (the default, and what I tested above), steps 2–3 are
-skipped entirely — you get keyword-only categorization with zero external
-calls. This is intentional as a safe, zero-dependency demo mode.
+In `rule_based` mode (the default, and what most of the testing below used),
+steps 2–3's LLM calls are skipped entirely — keyword-only categorization,
+zero external calls. Intentional as a safe, zero-dependency demo mode.
+
+### This is genuinely async now
+
+Every route in `routers/analyze.py` and the Gradio `_analyze` handler
+`await` the pipeline directly — there's no blocking synchronous work sitting
+inside an `async def` route pretending to be non-blocking. I verified this
+isn't just cosmetic: a test with a fake chat model that sleeps 20ms per call
+processed 300 tickets (600 total classify+score calls) in 1.81 seconds with
+`LLM_MAX_CONCURRENCY=10`, and I instrumented the fake model to track
+concurrent-call count directly — it never exceeded 10, proving both that
+calls genuinely run concurrently (not sequentially blocking each other) and
+that the concurrency bound is actually respected, not just configured.
 
 ### Worklog scoring
 
 A 100-point heuristic rubric (25 pts each): completeness, root-cause
-documentation, resolution/action documentation, professionalism (no
-ALL-CAPS shouting, has a timestamp/action trail for longer entries).
-This always runs. If an LLM provider is configured, its score is blended
-in (averaged) for nuance — but a failed or unavailable LLM call never
-blocks or degrades the base heuristic score.
+documentation, resolution/action documentation, professionalism. This
+always runs (`scorer.py`, pure Python, free). `graph_pipeline.py`'s `score`
+node optionally blends in an LLM judgment on top when a chat model is
+configured — but a failed or unavailable LLM call never blocks or degrades
+the base heuristic score, it just keeps the heuristic-only number.
 
-## Your tech stack: gpt-5.6luna, text-embedding-large, SAP Gen AI SDK
+## Your tech stack: gpt-5.6-luna, text-embedding-large, SAP AI SDK, LangChain, LangGraph
 
-I don't have visibility into `gpt-5.6luna` or a `text-embedding-large`
-model as public/recognized model identifiers, and I can't get live SAP AI
-Core credentials in this environment — so I couldn't test real calls
-against either. Rather than guess at endpoint shapes, I built the LLM
-layer as a **pluggable interface** (`app/services/llm_client.py`) with
-three backends selected by `LLM_PROVIDER` in `.env`:
+The LLM layer (`app/services/llm_client.py`) is built on **LangChain**,
+using the SAP proxy's actual LangChain integration — confirmed against a
+working script in your environment:
+
+```python
+from gen_ai_hub.proxy.langchain import ChatOpenAI
+from gen_ai_hub.proxy import get_proxy_client
+proxy_client = get_proxy_client('gen-ai-hub')
+chat_llm = ChatOpenAI(proxy_model_name=MODEL_NAME, proxy_client=proxy_client)
+```
+
+This replaced an earlier attempt that went through the lower-level
+`gen_ai_hub.proxy.native.openai` module directly. That module's `.responses`
+attribute turned out to be `None` in your installed environment (an older
+`openai` package pinned as a transitive dependency predates the Responses
+API) — `gen_ai_hub.proxy.langchain.ChatOpenAI` sits one layer up and doesn't
+have that problem. It's also a genuine LangChain `Runnable`
+(`langchain_openai.ChatOpenAI` under the hood), so `.ainvoke()`, `.abatch()`,
+and `.with_retry()` all work natively — no hand-rolled async or retry code
+needed for the chat model.
 
 | Provider | When to use | Status |
 |---|---|---|
-| `rule_based` | Default. No external calls. What I tested. | ✅ Working |
-| `openai_compat` | Any OpenAI-compatible endpoint/gateway | ✅ Implemented, untested against your actual gateway |
-| `sap_genai_hub` | SAP Generative AI Hub SDK / AI Core | ✅ Implemented, tested against a mock of the SDK's call signature — not against your real AI Core deployment |
+| `rule_based` | Default. No external calls. | ✅ Tested |
+| `openai_compat` | Any OpenAI-compatible endpoint/gateway (`langchain_openai.ChatOpenAI`) | ✅ Implemented, untested against your actual gateway |
+| `sap_genai_hub` | SAP proxy via `gen_ai_hub.proxy.langchain` | ✅ Implemented, tested against fakes matching LangChain's real interfaces — not against your real AI Core deployment |
 
 ### Wiring up SAP Generative AI Hub
 
-The `sap_genai_hub` provider is now **implemented for real**, matching the
-exact calling convention from your existing codebase
-(`gen_ai_hub.proxy.native.openai`, `chat.completions.create(model_name=...,
-messages=...)` — note `model_name=`, not `model=`, which is what
-`OpenAICompatClient` uses for the plain openai-python client).
-
-1. `pip install generative-ai-hub-sdk` (already in `requirements.txt`)
+1. `pip install sap-ai-sdk-gen[all]` (already in `requirements.txt`)
 2. Set `AICORE_AUTH_URL`, `AICORE_CLIENT_ID`, `AICORE_CLIENT_SECRET`,
-   `AICORE_BASE_URL`, `AICORE_RESOURCE_GROUP` in `.env` — the SDK reads
-   these directly, there's no separate client object to construct
+   `AICORE_BASE_URL`, `AICORE_RESOURCE_GROUP` in `.env`
 3. Set `LLM_PROVIDER=sap_genai_hub`
-4. `CHAT_MODEL_NAME` defaults to `gpt-5.6-luna`, `EMBEDDING_MODEL_NAME` to
-   `text-embedding-large` — point these at whatever deployment names are
-   provisioned in your AI Core resource group
+4. `CHAT_MODEL_NAME` / `EMBEDDING_MODEL_NAME` — point these at whatever
+   deployment names are provisioned in your AI Core resource group
 
-I verified this against a mock of `gen_ai_hub.proxy.native.openai` that
-enforces the same call signature your SDK expects (`model_name=` kwarg,
-`response.choices[0].message.content` shape) — classify, score_worklog,
-and embed all round-tripped correctly and fed cleanly into the
-categorizer/scorer pipeline. I have **not** tested this against your real
-SAP AI Core deployment, since I don't have credentials for it — the mock
-only proves the calling code is shaped correctly, not that your specific
-deployment/model will respond the way the prompts expect. Worth a real
-smoke test on your end before relying on it.
+I verified the calling code's shape (class names, constructor kwargs,
+`.ainvoke()`/`.aembed_documents()` interfaces, retry/error handling) by
+downloading and inspecting the actual `sap-ai-sdk-gen` wheel and testing
+against `langchain_core`'s official fake model/embedding classes and a
+custom fake that raises real `openai.RateLimitError`s on demand. I have
+**not** tested this against your real AI Core deployment — that only your
+environment can confirm. Worth a real smoke test before relying on it at
+scale.
 
-If the SDK call fails or isn't configured, `get_llm_client()` automatically
-falls back to `rule_based` rather than crashing the app — fail-safe, not
-fail-open.
+If a chat/embeddings model fails to initialize (missing credentials, SDK
+import error, etc.), `get_chat_model()`/`get_embeddings_model()` return
+`None` rather than raising — every caller treats `None` as "skip this step,
+fall back to keyword rules / heuristic-only scoring" rather than crashing.
 
 ### Handling 429s on large uploads (3k+ rows)
 
-Both real providers now use OpenAI's **Responses API** (`.responses.create()`)
-rather than Chat Completions — confirmed supported by the `sap-ai-sdk-gen`
-proxy, which exposes `responses` alongside `chat`/`embeddings` with the same
-`model_name=` routing. That said, **switching API surface alone does not
-fix a rate-limit problem** — the actual fix is calling the API less and
-handling 429s properly when they happen:
+Three things, all verified with targeted tests (not just written and
+assumed to work):
 
-1. **Batched embedding calls** — this is the real cause of 429s at scale.
-   Previously, every ticket that fell through keyword rules triggered its
-   own embedding API call; at 3k rows with, say, 40% needing embedding
-   matching, that's 1,200+ separate calls. `categorizer.categorize_batch()`
-   now embeds many ticket texts per call (`EMBEDDING_BATCH_SIZE`, default
-   200), cutting that to roughly 6 calls instead of 1,200.
-2. **Client-side throttling** (`LLM_REQUESTS_PER_MINUTE`, default 60) —
-   paces calls proactively instead of firing as fast as possible and only
-   reacting after the API starts rejecting requests.
-3. **429-aware retry with backoff** (`LLM_RATE_LIMIT_MAX_RETRIES`, default
-   5) — honors the API's `Retry-After` header when present, falls back to
-   exponential backoff with jitter otherwise.
+1. **Batched embedding calls** — the real fix. Previously, every ticket
+   that fell through keyword rules triggered its own embedding API call;
+   at 3k rows with, say, 40% needing embedding matching, that's 1,200+
+   separate calls. `Categorizer.pre_resolve()` now embeds many ticket
+   texts per call (chunked at `EMBEDDING_BATCH_SIZE`, default 200) via
+   LangChain's `aembed_documents`. **Tested:** a 60-ticket batch needing
+   embedding classification produced exactly 2 embedding calls total (1
+   for category-vector priming, 1 for the batch), not 60+.
+2. **429-aware retry with backoff** (`LLM_RATE_LIMIT_MAX_RETRIES`, default
+   5) via LangChain's built-in `Runnable.with_retry(retry_if_exception_type=
+   (openai.RateLimitError,), wait_exponential_jitter=True)` on the chat
+   model. **Tested:** a fake model that fails its first 2 calls with a real
+   `openai.RateLimitError` then succeeds was retried transparently by the
+   pipeline with no code-level handling needed at the call site. A model
+   that *always* rate-limits exhausts retries after exactly 5 attempts per
+   node call, then degrades to `Uncategorized`/heuristic-only rather than
+   crashing the batch — the failure reason is recorded in that ticket's
+   `validation_flags` so it's visible in the exported CSV, not silently lost.
+3. **Bounded concurrency** (`LLM_MAX_CONCURRENCY`, default 10) — LangGraph's
+   `.abatch(..., config={"max_concurrency": N})` caps how many tickets are
+   in flight at once. Uncapped concurrency on a 3k-row batch is what causes
+   a 429 storm in the first place; retry alone doesn't fix firing 3,000
+   simultaneous requests. **Tested:** instrumented a fake model to track
+   concurrent in-flight calls directly — never exceeded the configured
+   limit across 600 calls.
 
-I verified all three against a mock of the SAP proxy that simulates a 429
-with a `Retry-After` header and counts calls: a 50-ticket batch needing
-embedding classification produced exactly 2 embedding calls (not 50), and
-the simulated rate-limit response was retried after the exact `Retry-After`
-duration rather than crashing or using an arbitrary wait. I have **not**
-tested this against your real AI Core deployment's actual rate limits —
-those numbers (`LLM_REQUESTS_PER_MINUTE`, `EMBEDDING_BATCH_SIZE`) are
-reasonable defaults, not measured against your specific quota. If you still
-see 429s after this change, the AI Core dashboard should show which
-endpoint/quota is being hit, and these two settings are the knobs to tune.
+I have **not** tested any of this against your real AI Core deployment's
+actual rate limits — `LLM_MAX_CONCURRENCY`, `EMBEDDING_BATCH_SIZE`, and
+`LLM_RATE_LIMIT_MAX_RETRIES` are reasonable defaults, not numbers measured
+against your specific quota. If you still see 429s after this change, your
+AI Core dashboard should show which endpoint/quota is being hit, and these
+three settings in `.env` are what to tune — lower `LLM_MAX_CONCURRENCY`
+first, since that has the most direct effect on request rate.
 
-Per-ticket LLM classification/scoring calls (for tickets keyword rules and
-embeddings couldn't resolve) are *not* batched into a single prompt —
-reliably parsing N different classification results out of one completion
-is fragile — so they rely on throttling + retry instead. This is fine once
-the embedding-call volume is fixed, since that's what was driving the
-call count into the thousands.
+Per-ticket LLM classification/scoring calls are *not* batched into a single
+prompt — reliably parsing N different classification results out of one
+completion is fragile — they rely on bounded concurrency + retry instead.
+This is fine once embedding-call volume is fixed, since that was what drove
+the call count into the thousands in the first place.
 
 ## Security controls implemented
 

@@ -98,16 +98,16 @@ def _summary_markdown(analysis) -> str:
     )
 
 
-def _analyze(file_obj, pasted_text):
+async def _analyze(file_obj, pasted_text):
     if file_obj is None and not (pasted_text and pasted_text.strip()):
         raise gr.Error("Upload a file (CSV/XLSX/TXT) or paste incident text first.")
 
     if file_obj is not None:
         with open(file_obj.name, "rb") as f:
             content = f.read()
-        analysis = run_pipeline_from_bytes(file_obj.name, content)
+        analysis = await run_pipeline_from_bytes(file_obj.name, content)
     else:
-        analysis = run_pipeline_from_text(pasted_text)
+        analysis = await run_pipeline_from_text(pasted_text)
 
     df = _results_to_dataframe(analysis)
     chart_df = _category_chart_df(analysis)

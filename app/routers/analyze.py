@@ -23,7 +23,7 @@ async def analyze_file(file: UploadFile = File(...), api_key: str = Depends(veri
     validate_upload(file)
     try:
         content = await file.read()
-        result = run_pipeline_from_bytes(file.filename, content)
+        result = await run_pipeline_from_bytes(file.filename, content)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception:
@@ -41,7 +41,7 @@ async def analyze_text(raw_text: str, api_key: str = Depends(verify_api_key)):
     if len(raw_text) > 200_000:
         raise HTTPException(status_code=413, detail="Text input too large (max 200,000 characters).")
     try:
-        result = run_pipeline_from_text(raw_text)
+        result = await run_pipeline_from_text(raw_text)
     except Exception:
         logger.exception("Analysis pipeline failed")
         raise HTTPException(status_code=500, detail="Failed to analyze the provided text.")

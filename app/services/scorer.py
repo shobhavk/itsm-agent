@@ -1,9 +1,13 @@
 """
-Scores worklog/resolution-note quality 0-100. Heuristic rubric always runs
-(fast, free, explainable); the LLM client can be layered on top for nuance
-if configured, but the app never depends on it being available.
+Heuristic worklog/resolution-note quality rubric, 0-100. Always runs (free,
+instant, explainable) regardless of whether an LLM is configured.
 
-Rubric (heuristic), 25 points each:
+LLM-blended scoring (layering a model's judgment on top of this heuristic
+for nuance) happens in graph_pipeline.py's score_node, not here - keeping
+the async/LLM/retry concerns in one place (the LangGraph pipeline) rather
+than split across this module and the graph.
+
+Rubric, 25 points each:
   - completeness   : has enough substance (length, not a placeholder)
   - root_cause     : mentions cause/diagnosis language
   - resolution     : mentions concrete resolution/action language
@@ -13,7 +17,6 @@ Rubric (heuristic), 25 points each:
 import re
 
 from app.models.schemas import WorklogScore
-from app.services.llm_client import LLMClient
 
 _ROOT_CAUSE_HINTS = re.compile(
     r"\b(root cause|caused by|due to|because|diagnos(is|ed)|found that|identified)\b", re.IGNORECASE
@@ -90,30 +93,3 @@ def heuristic_score(worklog: str) -> WorklogScore:
         },
         flags=f1 + f2 + f3 + f4,
     )
-
-
-def score_worklog(ticket_id: str, worklog: str, context: str, llm_client: LLMClient | None = None) -> WorklogScore:
-    """Runs the heuristic scorer; if an LLM client is configured and available,
-    blends in its judgment (average) for nuance, but never fails the request
-    if the LLM call errors out."""
-    base = heuristic_score(worklog)
-    base.ticket_id = ticket_id
-
-    if llm_client is None or not worklog.strip():
-        return base
-
-    try:
-        from app.security import sanitize_for_llm
-
-        result = llm_client.score_worklog(sanitize_for_llm(worklog), sanitize_for_llm(context))
-        llm_score = result.get("score")
-        if isinstance(llm_score, (int, float)):
-            blended = round((base.score + llm_score) / 2)
-            base.score = max(0, min(100, blended))
-            base.flags = list(dict.fromkeys(base.flags + result.get("flags", [])))
-    except NotImplementedError:
-        pass
-    except Exception:
-        pass  # heuristic score already computed; degrade gracefully
-
-    return base
