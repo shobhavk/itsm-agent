@@ -10,6 +10,7 @@ python-dotenv==1.0.1
 tenacity==8.5.0
 numpy>=1.26.4
 chardet==5.2.0
+plotly==7.0.0
 
 # --- SAP Generative AI Hub + multi-provider stack, pinned to match the
 # versions verified in the itsm-agent project (see requirements.txt there).

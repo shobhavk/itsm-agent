@@ -12,6 +12,7 @@ from datetime import datetime
 
 import gradio as gr
 import pandas as pd
+import plotly.graph_objects as go
 
 from app.services.pipeline import run_pipeline_from_bytes, run_pipeline_from_text
 
@@ -35,7 +36,37 @@ footer {display: none !important;}
     margin-top: 14px; display: flex; align-items: center; justify-content: center; gap: 16px;
 }
 #page-indicator {text-align: center; font-size: 0.9rem; padding-top: 8px;}
-#input-row {gap: 32px !important; margin-bottom: 8px;}
+#input-row {gap: 24px !important; margin-bottom: 8px; align-items: flex-start;}
+#input-col {max-width: 340px;}
+#results-col h3 {margin-top: 0;}
+
+/* Gradio 6's Dataframe cells render with white-space:nowrap regardless of
+   the wrap=True Python param, which clips long Description/Worklog text
+   mid-word instead of wrapping to a taller row. Force real wrapping and
+   let rows size to their content, with a sane per-cell cap so one very
+   long value can't blow out the whole row. */
+#results-table .cell-wrap {
+    text-overflow: ellipsis !important;
+    padding: 8px 10px !important;
+}
+#results-table td, #results-table th {
+    vertical-align: middle !important;
+    border-bottom: 1px solid #eef1f5 !important;
+}
+#results-table tbody tr:hover td {
+    background: #f8fafc !important;
+}
+#results-table td, #results-table th {
+    height: auto !important;
+    vertical-align: top !important;
+    border-bottom: 1px solid #eef1f5 !important;
+}
+#results-table tbody tr:hover td {
+    background: #f8fafc !important;
+}
+#results-table tbody tr:nth-child(even) td {
+    background: #fbfcfe;
+}
 """
 
 SEVERITY_NOTE = (
@@ -52,6 +83,11 @@ def _score_badge(score: int) -> str:
     return "🔴 Poor"
 
 
+def _truncate(text: str, limit: int) -> str:
+    text = text or ""
+    return text[:limit] + "…" if len(text) > limit else text
+
+
 def _results_to_dataframe(analysis) -> pd.DataFrame:
     rows = []
     for r in analysis.results:
@@ -61,7 +97,36 @@ def _results_to_dataframe(analysis) -> pd.DataFrame:
                 "Category": r.category,
                 "Category Confidence": r.category_confidence,
                 "Category Method": r.category_method,
-                "Short Description": r.short_description[:120],
+                "Short Description": _truncate(r.short_description, 100),
+                "Description": _truncate(r.description, 140),
+                "Worklog Notes": _truncate(r.worklog, 140),
+                "Worklog Score": r.worklog_score,
+                "Worklog Rating": _score_badge(r.worklog_score),
+                "Worklog Flags": "; ".join(r.worklog_flags) if r.worklog_flags else "",
+                "Priority": r.priority or "",
+                "Status": r.status or "",
+                "Assignment Group": r.assignment_group or "",
+                "Validation Notes": "; ".join(r.validation_flags) if r.validation_flags else "",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _results_to_full_dataframe(analysis) -> pd.DataFrame:
+    """Untruncated version for CSV export - the on-screen table truncates
+    long text for readability, but "download full results" should contain
+    the actual full text, not the display-truncated version."""
+    rows = []
+    for r in analysis.results:
+        rows.append(
+            {
+                "Ticket ID": r.ticket_id,
+                "Category": r.category,
+                "Category Confidence": r.category_confidence,
+                "Category Method": r.category_method,
+                "Short Description": r.short_description,
+                "Description": r.description,
+                "Worklog Notes": r.worklog,
                 "Worklog Score": r.worklog_score,
                 "Worklog Rating": _score_badge(r.worklog_score),
                 "Worklog Flags": "; ".join(r.worklog_flags) if r.worklog_flags else "",
@@ -77,10 +142,43 @@ def _results_to_dataframe(analysis) -> pd.DataFrame:
 def _category_chart_df(analysis) -> pd.DataFrame:
     if not analysis.category_counts:
         return pd.DataFrame({"Category": [], "Count": []})
-    # Ascending here so the horizontal bar chart reads top-to-bottom as
-    # highest-to-lowest count (BarPlot draws category-axis bottom-to-top).
-    items = sorted(analysis.category_counts.items(), key=lambda kv: kv[1])
+    # Descending here since a donut chart reads clockwise from the top,
+    # largest slice first.
+    items = sorted(analysis.category_counts.items(), key=lambda kv: kv[1], reverse=True)
     return pd.DataFrame(items, columns=["Category", "Count"])
+
+
+def _category_chart_figure(analysis) -> go.Figure:
+    """Donut chart of ticket volume by category (replaces the old bar chart)."""
+    chart_df = _category_chart_df(analysis)
+    if chart_df.empty:
+        fig = go.Figure()
+        fig.update_layout(
+            annotations=[dict(text="No data yet", showarrow=False, font=dict(size=14))],
+            height=340,
+            margin=dict(t=30, b=10, l=10, r=10),
+        )
+        return fig
+
+    fig = go.Figure(
+        data=[
+            go.Pie(
+                labels=chart_df["Category"],
+                values=chart_df["Count"],
+                hole=0.55,
+                sort=False,
+                textinfo="percent",
+                hovertemplate="%{label}: %{value} tickets (%{percent})<extra></extra>",
+            )
+        ]
+    )
+    fig.update_layout(
+        title="Tickets by Category",
+        height=340,
+        margin=dict(t=40, b=10, l=10, r=10),
+        legend=dict(orientation="v", yanchor="middle", y=0.5, xanchor="left", x=1.02),
+    )
+    return fig
 
 
 PAGE_SIZE_CHOICES = [10, 25, 50]
@@ -110,27 +208,19 @@ async def _analyze(file_obj, pasted_text):
         analysis = await run_pipeline_from_text(pasted_text)
 
     df = _results_to_dataframe(analysis)
-    chart_df = _category_chart_df(analysis)
+    full_df = _results_to_full_dataframe(analysis)
     summary = _summary_markdown(analysis)
 
-    # Prepare CSV for download - always the FULL result set, independent of
-    # whatever filter/page the table happens to be showing.
+    # Prepare CSV for download - always the FULL untruncated result set,
+    # independent of whatever filter/page/truncation the on-screen table
+    # is showing.
     csv_buf = io.StringIO()
-    df.to_csv(csv_buf, index=False)
+    full_df.to_csv(csv_buf, index=False)
     csv_path = f"/tmp/itsm_quality_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     with open(csv_path, "w") as f:
         f.write(csv_buf.getvalue())
 
-    chart = gr.BarPlot(
-        chart_df,
-        x="Count",
-        y="Category",
-        title="Tickets by Category",
-        x_lim=[0, None],
-        x_axis_format="d",
-        y_aggregate="sum",
-        height=max(320, 34 * max(len(chart_df), 1)),
-    )
+    chart = _category_chart_figure(analysis)
 
     return summary, chart, csv_path, df
 
@@ -186,40 +276,45 @@ def build_ui() -> gr.Blocks:
         )
         gr.Markdown(f"_{SEVERITY_NOTE}_")
 
-        with gr.Row(elem_id="input-row"):
-            with gr.Column(scale=1):
+        with gr.Row(elem_id="input-row", equal_height=False):
+            # Compact input column - just enough for the upload/paste/analyze
+            # controls, so the results table gets the bulk of the width.
+            with gr.Column(scale=1, min_width=280, elem_id="input-col"):
                 file_input = gr.File(label="Upload incident file (.xlsx, .csv, .txt)", file_types=[".xlsx", ".xls", ".csv", ".txt"])
-                text_input = gr.Textbox(label="...or paste unstructured incident text", lines=6,
+                text_input = gr.Textbox(label="...or paste unstructured incident text", lines=3,
                                           placeholder="INC0012345\nShort description: ...\nWorklog: ...")
                 analyze_btn = gr.Button("Analyze", variant="primary")
+                download_file = gr.File(label="Download full results as CSV", interactive=False)
+
+            # Categorized results sit to the right of the input column.
+            with gr.Column(scale=3, elem_id="results-col"):
+                gr.Markdown("### Categorized Results")
+                with gr.Row(elem_id="filters-row"):
+                    category_filter = gr.Dropdown(choices=["All"] + [c for c in CATEGORIES], value="All", label="Filter by category")
+                    score_filter = gr.Slider(0, 100, value=0, step=5, label="Minimum worklog score")
+                    page_size_dd = gr.Dropdown(choices=PAGE_SIZE_CHOICES, value=DEFAULT_PAGE_SIZE, label="Rows per page")
+
+                results_table = gr.Dataframe(
+                    label="Analyzed Tickets",
+                    interactive=False,
+                    wrap=True,
+                    max_height=520,
+                    column_widths=[100, 170, 90, 100, 170, 240, 240, 90, 130, 200, 70, 90, 130, 180],
+                    elem_id="results-table",
+                )
+
+                with gr.Row(elem_id="pagination-row"):
+                    prev_btn = gr.Button("← Previous", size="sm")
+                    page_indicator = gr.Markdown("Page 1 of 1  ·  0 tickets", elem_id="page-indicator")
+                    next_btn = gr.Button("Next →", size="sm")
+
+        # Summary stats + category donut chart get their own full-width row
+        # below the input/results row.
+        with gr.Row(elem_id="chart-row"):
             with gr.Column(scale=1):
                 summary_md = gr.Markdown("Run an analysis to see summary stats here.")
-
-        # Chart gets its own full-width row so long category names have
-        # room to breathe instead of competing with the input column.
-        with gr.Row(elem_id="chart-row"):
-            category_chart = gr.BarPlot(label="Category Distribution", height=320)
-
-        gr.Markdown("### Results", elem_classes=["section-block"])
-        with gr.Row(elem_id="filters-row"):
-            category_filter = gr.Dropdown(choices=["All"] + [c for c in CATEGORIES], value="All", label="Filter by category")
-            score_filter = gr.Slider(0, 100, value=0, step=5, label="Minimum worklog score")
-            page_size_dd = gr.Dropdown(choices=PAGE_SIZE_CHOICES, value=DEFAULT_PAGE_SIZE, label="Rows per page")
-
-        results_table = gr.Dataframe(
-            label="Analyzed Tickets",
-            interactive=False,
-            wrap=True,
-            max_height=520,
-            column_widths=[110, 190, 90, 110, 220, 90, 140, 220, 80, 90, 140, 200],
-        )
-
-        with gr.Row(elem_id="pagination-row"):
-            prev_btn = gr.Button("← Previous", size="sm")
-            page_indicator = gr.Markdown("Page 1 of 1  ·  0 tickets", elem_id="page-indicator")
-            next_btn = gr.Button("Next →", size="sm")
-
-        download_file = gr.File(label="Download full results as CSV", interactive=False)
+            with gr.Column(scale=1):
+                category_chart = gr.Plot(label="Category Distribution")
 
         full_results_state = gr.State(pd.DataFrame())
         filtered_results_state = gr.State(pd.DataFrame())
