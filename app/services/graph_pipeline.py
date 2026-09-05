@@ -1,15 +1,30 @@
 """
 LangGraph pipeline: a small per-ticket state machine with `classify` and
 `score` nodes, processed for many tickets at once via `.abatch()` with
-bounded concurrency (LLM_MAX_CONCURRENCY). This is where the two
-genuinely-per-ticket, LLM-involving steps happen:
+bounded concurrency (LLM_MAX_CONCURRENCY).
 
   - classify: only for tickets the cheap keyword/embedding pre-pass
     (categorizer.py) couldn't resolve - `state["category"]` is already
     filled in for everything else, so this node is a no-op for most
     tickets in a typical batch.
-  - score: always runs (the heuristic rubric is free), optionally blends
-    in an LLM judgment when a chat model is configured.
+  - score: the heuristic rubric (scorer.py) always runs and is free/instant.
+    Blending in an LLM judgment on top only happens if
+    ENABLE_LLM_WORKLOG_SCORING is set - it's optional nuance, not required
+    for a usable score, and was previously the dominant cause of slowness:
+    it ran for EVERY ticket with a worklog regardless of whether
+    categorization was already resolved for free, so even a 10-row batch
+    where every ticket matched a keyword rule still triggered 10 extra LLM
+    round-trips just for scoring.
+
+Both LLM calls use LangChain's expression-language chain pattern
+(`prompt | chat_model`) rather than passing raw message dicts to
+`.ainvoke()` directly - matches the documented gen_ai_hub.proxy.langchain
+usage pattern. Still invoked via `.ainvoke()` (the async form of the same
+chain), not blocking `.invoke()` in a loop - for a batch of N tickets,
+awaiting N calls concurrently (bounded by LLM_MAX_CONCURRENCY) is what
+keeps wall-clock time close to a single call's latency instead of N times
+that; switching to sync `.invoke()` per ticket would make batches slower,
+not faster.
 
 Why the pre-pass lives outside this graph: LangGraph's per-item StateGraph
 model is a natural fit for "run this same small flow over N independent
@@ -30,9 +45,11 @@ of them.
 import json
 import logging
 
+from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import END, START, StateGraph
 from typing_extensions import TypedDict
 
+from app.config import get_settings
 from app.models.schemas import CATEGORIES
 from app.security import sanitize_for_llm
 from app.services.json_utils import extract_json
@@ -40,6 +57,33 @@ from app.services.llm_client import SYSTEM_GUARDRAIL
 from app.services.scorer import heuristic_score
 
 logger = logging.getLogger(__name__)
+settings = get_settings()
+
+_CLASSIFY_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        ("system", SYSTEM_GUARDRAIL),
+        (
+            "user",
+            "Classify the ticket below into exactly one of these categories: "
+            "{categories}.\n<<<DATA>>>\n{text}\n<<<END_DATA>>>\n"
+            'Respond as JSON only: {{"category": "...", "confidence": 0.0}}',
+        ),
+    ]
+)
+
+_SCORE_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        ("system", SYSTEM_GUARDRAIL),
+        (
+            "user",
+            "Score this ITSM worklog's quality from 0-100 based on: clarity, "
+            "root-cause documented, resolution steps documented, timestamps/"
+            "actions present, professionalism.\n"
+            "<<<DATA>>>\nContext: {context}\nWorklog: {worklog}\n<<<END_DATA>>>\n"
+            'Respond as JSON only: {{"score": 0, "breakdown": {{}}, "flags": ["..."]}}',
+        ),
+    ]
+)
 
 
 class TicketState(TypedDict):
@@ -70,14 +114,8 @@ async def classify_node(state: TicketState, chat_model) -> TicketState:
     try:
         safe_text = sanitize_for_llm(state["text"])
         categories = [c for c in CATEGORIES if c != "Uncategorized"]
-        prompt = (
-            f"Classify the ticket below into exactly one of these categories: "
-            f"{categories}.\n<<<DATA>>>\n{safe_text}\n<<<END_DATA>>>\n"
-            'Respond as JSON only: {"category": "...", "confidence": 0.0}'
-        )
-        response = await chat_model.ainvoke(
-            [{"role": "system", "content": SYSTEM_GUARDRAIL}, {"role": "user", "content": prompt}]
-        )
+        chain = _CLASSIFY_PROMPT | chat_model
+        response = await chain.ainvoke({"categories": categories, "text": safe_text})
         parsed = json.loads(extract_json(response.content))
         category = parsed.get("category")
         if category not in CATEGORIES:
@@ -97,17 +135,11 @@ async def score_node(state: TicketState, chat_model) -> TicketState:
     base = heuristic_score(state["worklog"])
     score, flags = base.score, list(base.flags)
 
-    if chat_model is not None and state["worklog"].strip():
+    if settings.ENABLE_LLM_WORKLOG_SCORING and chat_model is not None and state["worklog"].strip():
         try:
-            prompt = (
-                "Score this ITSM worklog's quality from 0-100 based on: clarity, "
-                "root-cause documented, resolution steps documented, timestamps/"
-                "actions present, professionalism.\n"
-                f"<<<DATA>>>\nContext: {sanitize_for_llm(state['text'])}\nWorklog: {sanitize_for_llm(state['worklog'])}\n<<<END_DATA>>>\n"
-                'Respond as JSON only: {"score": 0, "breakdown": {}, "flags": ["..."]}'
-            )
-            response = await chat_model.ainvoke(
-                [{"role": "system", "content": SYSTEM_GUARDRAIL}, {"role": "user", "content": prompt}]
+            chain = _SCORE_PROMPT | chat_model
+            response = await chain.ainvoke(
+                {"context": sanitize_for_llm(state["text"]), "worklog": sanitize_for_llm(state["worklog"])}
             )
             parsed = json.loads(extract_json(response.content))
             llm_score = parsed.get("score")

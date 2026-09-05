@@ -67,6 +67,14 @@ class Settings(BaseSettings):
     # pipeline graph. Bounds concurrency so a 3k-row upload doesn't fire
     # 3000 simultaneous requests (the direct cause of 429s at scale).
     LLM_MAX_CONCURRENCY: int = 10
+    # Worklog scoring: the heuristic rubric (scorer.py) always runs and is
+    # free/instant. Blending in an LLM judgment on top is OPTIONAL nuance -
+    # off by default. Previously this ran unconditionally for every ticket
+    # with a worklog, which meant even tickets fully resolved for free by
+    # keyword rules still triggered a full extra LLM round-trip just for
+    # scoring - the dominant cause of slowness on small batches. Turn this
+    # on only if the heuristic score alone isn't good enough for your data.
+    ENABLE_LLM_WORKLOG_SCORING: bool = False
 
 
 @lru_cache

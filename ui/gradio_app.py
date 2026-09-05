@@ -42,24 +42,27 @@ footer {display: none !important;}
 
 /* Gradio 6's Dataframe cells render with white-space:nowrap regardless of
    the wrap=True Python param, which clips long Description/Worklog text
-   mid-word instead of wrapping to a taller row. Force real wrapping and
-   let rows size to their content, with a sane per-cell cap so one very
-   long value can't blow out the whole row. */
+   mid-word instead of wrapping. Keep single-line + ellipsis (multi-line
+   wrapping breaks this virtualized grid's row positioning), but keep rows
+   compact - smaller padding/font than the default so more rows fit on
+   screen at once. */
 #results-table .cell-wrap {
+    white-space: nowrap !important;
+    overflow: hidden !important;
     text-overflow: ellipsis !important;
-    padding: 8px 10px !important;
-}
-#results-table td, #results-table th {
-    vertical-align: middle !important;
-    border-bottom: 1px solid #eef1f5 !important;
-}
-#results-table tbody tr:hover td {
-    background: #f8fafc !important;
+    padding: 5px 8px !important;
+    font-size: 0.85rem !important;
+    line-height: 1.3 !important;
 }
 #results-table td, #results-table th {
     height: auto !important;
-    vertical-align: top !important;
+    vertical-align: middle !important;
     border-bottom: 1px solid #eef1f5 !important;
+    padding: 2px 4px !important;
+}
+#results-table th .cell-wrap {
+    font-size: 0.8rem !important;
+    font-weight: 600 !important;
 }
 #results-table tbody tr:hover td {
     background: #f8fafc !important;
@@ -97,16 +100,14 @@ def _results_to_dataframe(analysis) -> pd.DataFrame:
                 "Category": r.category,
                 "Category Confidence": r.category_confidence,
                 "Category Method": r.category_method,
-                "Short Description": _truncate(r.short_description, 100),
-                "Description": _truncate(r.description, 140),
-                "Worklog Notes": _truncate(r.worklog, 140),
+                "Description": _truncate(r.description, 60),
+                "Worklog Notes": _truncate(r.worklog, 60),
                 "Worklog Score": r.worklog_score,
                 "Worklog Rating": _score_badge(r.worklog_score),
                 "Worklog Flags": "; ".join(r.worklog_flags) if r.worklog_flags else "",
                 "Priority": r.priority or "",
                 "Status": r.status or "",
                 "Assignment Group": r.assignment_group or "",
-                "Validation Notes": "; ".join(r.validation_flags) if r.validation_flags else "",
             }
         )
     return pd.DataFrame(rows)
@@ -299,7 +300,7 @@ def build_ui() -> gr.Blocks:
                     interactive=False,
                     wrap=True,
                     max_height=520,
-                    column_widths=[100, 170, 90, 100, 170, 240, 240, 90, 130, 200, 70, 90, 130, 180],
+                    column_widths=[100, 170, 90, 100, 260, 260, 90, 130, 200, 70, 90, 140],
                     elem_id="results-table",
                 )
 
