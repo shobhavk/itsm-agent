@@ -96,6 +96,60 @@ footer {display: none !important;}
 #page-indicator {text-align: center; font-size: 0.85rem; color: var(--dash-text-muted); padding-top: 8px;}
 
 #chart-row {margin-top: 20px;}
+
+/* Animated "agent working" progress bar - shown in a single fixed spot
+   (right under the header, above the input/results row) while an
+   analysis is running, instead of Gradio's default per-component
+   loading overlays scattered across the summary/donut chart section. */
+#agent-progress {margin: 0 0 16px;}
+.agent-progress {
+    display: flex; align-items: center; gap: 14px;
+    background: #ffffff; border: 1px solid var(--dash-border); border-radius: 14px;
+    padding: 12px 20px; box-shadow: var(--dash-shadow);
+}
+.agent-progress-icon {
+    font-size: 1.3rem; flex-shrink: 0;
+    animation: agent-bounce 1s ease-in-out infinite;
+}
+@keyframes agent-bounce {
+    0%, 100% {transform: translateY(0) rotate(0deg);}
+    50% {transform: translateY(-4px) rotate(-6deg);}
+}
+.agent-progress-track {
+    position: relative; flex: 1; height: 8px; border-radius: 999px;
+    background: #eef1f5; overflow: hidden;
+}
+.agent-progress-fill {
+    position: absolute; top: 0; left: -40%; width: 40%; height: 100%; border-radius: 999px;
+    background: linear-gradient(90deg, #16345c, #3b82f6, #16345c);
+    animation: agent-slide 1.15s ease-in-out infinite;
+}
+@keyframes agent-slide {
+    0% {left: -40%;}
+    100% {left: 100%;}
+}
+.agent-progress-text {
+    font-size: 0.85rem; font-weight: 600; color: var(--dash-text);
+    white-space: nowrap; flex-shrink: 0;
+}
+.agent-progress-text .dots span {
+    animation: agent-dot 1.4s infinite; opacity: 0;
+}
+.agent-progress-text .dots span:nth-child(2) {animation-delay: 0.2s;}
+.agent-progress-text .dots span:nth-child(3) {animation-delay: 0.4s;}
+@keyframes agent-dot {
+    0% {opacity: 0;}
+    20% {opacity: 1;}
+    100% {opacity: 0;}
+}
+"""
+
+AGENT_PROGRESS_HTML = """
+<div class="agent-progress">
+  <span class="agent-progress-icon">🤖</span>
+  <div class="agent-progress-track"><div class="agent-progress-fill"></div></div>
+  <span class="agent-progress-text">Agent analyzing tickets<span class="dots"><span>.</span><span>.</span><span>.</span></span></span>
+</div>
 """
 
 SEVERITY_NOTE = (
@@ -128,6 +182,18 @@ def _strip_html(text: str) -> str:
 def _truncate(text: str, limit: int) -> str:
     text = _strip_html(text)
     return text[:limit] + "…" if len(text) > limit else text
+
+
+ALL_COLUMNS = [
+    "Ticket ID", "Category", "Category Confidence", "Category Method",
+    "Short Description", "Description", "Worklog Notes", "Worklog Score",
+    "Worklog Rating", "Worklog Flags", "Priority", "Status",
+    "Assignment Group", "Validation Notes",
+]
+DEFAULT_VISIBLE_COLUMNS = [
+    c for c in ALL_COLUMNS
+    if c not in ("Short Description", "Category Confidence", "Validation Notes")
+]
 
 
 def _results_to_dataframe(analysis) -> pd.DataFrame:
@@ -242,6 +308,11 @@ async def _analyze(file_obj, pasted_text):
     if file_obj is None and not (pasted_text and pasted_text.strip()):
         raise gr.Error("Upload a file (CSV/XLSX/TXT) or paste incident text first.")
 
+    # Show the animated agent progress bar in its single fixed spot before
+    # doing any work; other outputs are left untouched (gr.update()) so
+    # nothing under them flickers or shows its own loading state.
+    yield gr.update(visible=True), gr.update(), gr.update(), gr.update(), gr.update()
+
     if file_obj is not None:
         with open(file_obj.name, "rb") as f:
             content = f.read()
@@ -264,7 +335,22 @@ async def _analyze(file_obj, pasted_text):
 
     chart = _category_chart_figure(analysis)
 
-    return summary, chart, csv_path, df
+    yield gr.update(visible=False), summary, chart, csv_path, df
+
+
+def _select_columns(df: pd.DataFrame, selected_cols) -> pd.DataFrame:
+    """Restricts a dataframe to the user-chosen columns for on-screen
+    display, keeping them in the fixed ALL_COLUMNS order regardless of the
+    order the user (de)selected them in. Filtering/pagination/CSV export
+    always operate on the full, un-reduced dataframe - only this final
+    display step drops columns."""
+    cols = [c for c in ALL_COLUMNS if c in (selected_cols or DEFAULT_VISIBLE_COLUMNS)]
+    if df is None or len(df) == 0:
+        return pd.DataFrame(columns=cols or ["Ticket ID"])
+    cols = [c for c in cols if c in df.columns]
+    if not cols:
+        cols = ["Ticket ID"]  # never render a fully empty table
+    return df[cols]
 
 
 def _apply_filters(full_df: pd.DataFrame, category: str, min_score: int) -> pd.DataFrame:
@@ -289,18 +375,25 @@ def _paginate(filtered_df: pd.DataFrame, page: int, page_size: int):
     return page_df, indicator, page
 
 
-def _refresh_view(full_df, category, min_score, page_size):
+def _refresh_view(full_df, category, min_score, page_size, columns):
     """Re-applies filters, resets to page 1, and returns everything the
     table/pagination controls need. Used after a new analysis runs or
     whenever a filter/page-size control changes."""
     filtered = _apply_filters(full_df, category, min_score)
     page_df, indicator, page = _paginate(filtered, 1, page_size)
-    return page_df, indicator, filtered, page
+    return _select_columns(page_df, columns), indicator, filtered, page
 
 
-def _go_to_page(filtered_df, page, page_size, delta):
+def _go_to_page(filtered_df, page, page_size, columns, delta):
     page_df, indicator, new_page = _paginate(filtered_df, (page or 1) + delta, page_size)
-    return page_df, indicator, new_page
+    return _select_columns(page_df, columns), indicator, new_page
+
+
+def _apply_columns(filtered_df, page, page_size, columns):
+    """Just re-renders the current page with the newly (de)selected
+    columns - doesn't touch filters or reset pagination."""
+    page_df, indicator, page = _paginate(filtered_df, page or 1, page_size)
+    return _select_columns(page_df, columns), indicator, page
 
 
 def build_ui() -> gr.Blocks:
@@ -317,6 +410,8 @@ def build_ui() -> gr.Blocks:
             """
         )
         gr.Markdown(f"_{SEVERITY_NOTE}_")
+
+        agent_progress = gr.HTML(AGENT_PROGRESS_HTML, elem_id="agent-progress", visible=False)
 
         with gr.Row(elem_id="input-row", equal_height=False):
             # Compact input column - just enough for the upload/paste/analyze
@@ -335,13 +430,16 @@ def build_ui() -> gr.Blocks:
                     category_filter = gr.Dropdown(choices=["All"] + [c for c in CATEGORIES], value="All", label="Filter by category")
                     score_filter = gr.Slider(0, 100, value=0, step=5, label="Minimum worklog score")
                     page_size_dd = gr.Dropdown(choices=PAGE_SIZE_CHOICES, value=DEFAULT_PAGE_SIZE, label="Rows per page")
+                    column_select = gr.Dropdown(
+                        choices=ALL_COLUMNS, value=DEFAULT_VISIBLE_COLUMNS,
+                        multiselect=True, label="Columns to display",
+                    )
 
                 results_table = gr.Dataframe(
                     label="Analyzed Tickets",
                     interactive=False,
                     wrap=False,
                     max_height=400,
-                    column_widths=[100, 170, 90, 100, 170, 240, 240, 90, 130, 200, 70, 90, 130, 180],
                     elem_id="results-table",
                 )
 
@@ -365,28 +463,34 @@ def build_ui() -> gr.Blocks:
         analyze_btn.click(
             fn=_analyze,
             inputs=[file_input, text_input],
-            outputs=[summary_md, category_chart, download_file, full_results_state],
+            outputs=[agent_progress, summary_md, category_chart, download_file, full_results_state],
         ).then(
             fn=_refresh_view,
-            inputs=[full_results_state, category_filter, score_filter, page_size_dd],
+            inputs=[full_results_state, category_filter, score_filter, page_size_dd, column_select],
             outputs=[results_table, page_indicator, filtered_results_state, page_state],
         )
 
         for control in (category_filter, score_filter, page_size_dd):
             control.change(
                 fn=_refresh_view,
-                inputs=[full_results_state, category_filter, score_filter, page_size_dd],
+                inputs=[full_results_state, category_filter, score_filter, page_size_dd, column_select],
                 outputs=[results_table, page_indicator, filtered_results_state, page_state],
             )
 
+        column_select.change(
+            fn=_apply_columns,
+            inputs=[filtered_results_state, page_state, page_size_dd, column_select],
+            outputs=[results_table, page_indicator, page_state],
+        )
+
         prev_btn.click(
-            fn=lambda filtered_df, page, page_size: _go_to_page(filtered_df, page, page_size, -1),
-            inputs=[filtered_results_state, page_state, page_size_dd],
+            fn=lambda filtered_df, page, page_size, columns: _go_to_page(filtered_df, page, page_size, columns, -1),
+            inputs=[filtered_results_state, page_state, page_size_dd, column_select],
             outputs=[results_table, page_indicator, page_state],
         )
         next_btn.click(
-            fn=lambda filtered_df, page, page_size: _go_to_page(filtered_df, page, page_size, 1),
-            inputs=[filtered_results_state, page_state, page_size_dd],
+            fn=lambda filtered_df, page, page_size, columns: _go_to_page(filtered_df, page, page_size, columns, 1),
+            inputs=[filtered_results_state, page_state, page_size_dd, column_select],
             outputs=[results_table, page_indicator, page_state],
         )
 
