@@ -66,6 +66,27 @@ footer {display: none !important;}
 }
 #results-col h3 {margin: 0 0 12px; font-size: 1.02rem; font-weight: 600;}
 
+/* Compact upload dropzone - the default Gradio File drop area is tall
+   and mostly empty space; shrink it down to a slim strip. */
+#file-upload {min-height: 0 !important;}
+#file-upload .wrap {
+    min-height: 54px !important; padding: 8px 12px !important;
+}
+#file-upload .wrap svg {width: 18px !important; height: 18px !important; margin-bottom: 2px !important;}
+#file-upload .wrap > * {font-size: 0.75rem !important;}
+
+/* Column picker moved into the left rail, next to the upload controls -
+   keep it compact so it doesn't stretch the column, with its own small
+   scroll once a few columns are picked instead of growing forever. */
+#column-select {margin-top: 2px;}
+#column-select label {font-size: 0.85rem;}
+#column-select .wrap-inner {
+    max-height: 92px !important; overflow-y: auto !important; gap: 4px !important;
+}
+#column-select .token {
+    font-size: 0.7rem !important; padding: 2px 8px !important; border-radius: 999px !important;
+}
+
 #filters-row {margin-bottom: 14px; gap: 18px !important;}
 
 /* Results table - fixed-height, single-line rows instead of letting long
@@ -191,8 +212,8 @@ ALL_COLUMNS = [
     "Assignment Group", "Validation Notes",
 ]
 DEFAULT_VISIBLE_COLUMNS = [
-    c for c in ALL_COLUMNS
-    if c not in ("Short Description", "Category Confidence", "Validation Notes")
+    "Ticket ID", "Category", "Description", "Worklog Notes",
+    "Worklog Score", "Priority", "Assignment Group",
 ]
 
 
