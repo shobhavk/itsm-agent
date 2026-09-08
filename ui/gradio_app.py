@@ -17,59 +17,84 @@ import plotly.graph_objects as go
 from app.services.pipeline import run_pipeline_from_bytes, run_pipeline_from_text
 
 CUSTOM_CSS = """
-.gradio-container {max-width: 1500px !important; margin: auto; padding: 12px 24px !important;}
-#header-banner {
-    background: linear-gradient(90deg, #0f2540 0%, #16345c 100%);
-    color: white; padding: 20px 28px; border-radius: 10px; margin-bottom: 18px;
+:root {
+    --dash-bg: #f5f6fa;
+    --dash-border: #e5e9f0;
+    --dash-text-muted: #64748b;
+    --dash-text: #0f172a;
+    --dash-shadow: 0 1px 3px rgba(15, 23, 42, 0.06);
 }
-#header-banner h1 {margin: 0; font-size: 1.4rem;}
-#header-banner p {margin: 6px 0 0 0; opacity: 0.85; font-size: 0.9rem;}
-.metric-card {border: 1px solid #e2e8f0; border-radius: 10px; padding: 14px; text-align: center;}
+
+.gradio-container {
+    max-width: 1560px !important; margin: auto; padding: 16px 28px 32px !important;
+    background: var(--dash-bg) !important; font-family: "Inter", "Segoe UI", system-ui, sans-serif;
+}
 footer {display: none !important;}
 
-.section-block {margin-top: 28px; margin-bottom: 8px;}
-.section-block h3 {margin-bottom: 4px;}
-
-#chart-row {margin-top: 20px; margin-bottom: 20px;}
-#filters-row {margin-bottom: 12px; gap: 24px !important;}
-#pagination-row {
-    margin-top: 14px; display: flex; align-items: center; justify-content: center; gap: 16px;
+#header-banner {
+    background: linear-gradient(90deg, #0f2540 0%, #16345c 100%);
+    color: white; padding: 22px 28px; border-radius: 14px; margin-bottom: 14px;
 }
-#page-indicator {text-align: center; font-size: 0.9rem; padding-top: 8px;}
-#input-row {gap: 24px !important; margin-bottom: 8px; align-items: flex-start;}
-#input-col {max-width: 340px;}
-#results-col h3 {margin-top: 0;}
+#header-banner h1 {margin: 0; font-size: 1.35rem; font-weight: 600; letter-spacing: -0.01em;}
+#header-banner p {margin: 6px 0 0 0; opacity: 0.85; font-size: 0.88rem;}
 
-/* Gradio 6's Dataframe cells render with white-space:nowrap regardless of
-   the wrap=True Python param, which clips long Description/Worklog text
-   mid-word instead of wrapping. Keep single-line + ellipsis (multi-line
-   wrapping breaks this virtualized grid's row positioning), but keep rows
-   compact - smaller padding/font than the default so more rows fit on
-   screen at once. */
-#results-table .cell-wrap {
-    white-space: nowrap !important;
-    overflow: hidden !important;
-    text-overflow: ellipsis !important;
-    padding: 5px 8px !important;
-    font-size: 0.85rem !important;
-    line-height: 1.3 !important;
+.severity-note {font-size: 0.8rem; color: var(--dash-text-muted); margin: 0 0 18px 2px;}
+
+/* Card wrapper used around every major section - gives the dribbble-style
+   raised-panel look instead of controls floating on the bare page. */
+.dash-card {
+    background: #ffffff !important; border: 1px solid var(--dash-border) !important;
+    border-radius: 16px !important; padding: 18px 20px !important; box-shadow: var(--dash-shadow);
 }
-#results-table td, #results-table th {
-    height: auto !important;
+
+/* KPI strip */
+#metrics-row {margin-bottom: 18px; gap: 14px !important;}
+.kpi-grid {display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px;}
+.kpi-card {
+    background: #ffffff; border: 1px solid var(--dash-border); border-radius: 14px;
+    padding: 14px 18px; box-shadow: var(--dash-shadow); border-left: 4px solid var(--accent, #3b82f6);
+}
+.kpi-label {font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--dash-text-muted); margin-bottom: 6px;}
+.kpi-value {font-size: 1.5rem; font-weight: 700; color: var(--dash-text); line-height: 1;}
+
+#input-row {gap: 18px !important; margin-bottom: 18px; align-items: stretch;}
+#input-col {max-width: 340px; display: flex; flex-direction: column; gap: 10px;}
+#input-col label {font-weight: 600; font-size: 0.85rem;}
+#input-col button.primary {
+    border-radius: 10px !important; font-weight: 600 !important; box-shadow: 0 1px 2px rgba(15,23,42,.18);
+}
+#results-col h3 {margin: 0 0 12px; font-size: 1.02rem; font-weight: 600;}
+
+#filters-row {margin-bottom: 14px; gap: 18px !important;}
+
+/* Results table - fixed-height, single-line rows instead of letting long
+   Description/Worklog text blow rows out. The Python side already
+   truncates + strips HTML tags (see _preview_html); this just makes sure
+   the CSS doesn't fight that by re-wrapping or auto-growing rows. Full
+   text is available on hover via the native title tooltip. */
+#results-table table th {
+    background: #f8fafc !important; font-weight: 600 !important; font-size: 0.75rem !important;
+    text-transform: uppercase; letter-spacing: 0.03em; color: var(--dash-text-muted) !important;
+    padding: 12px 14px !important;
+}
+#results-table table td {
+    padding: 10px 14px !important; font-size: 0.83rem !important;
+    height: 40px !important; max-height: 40px !important;
     vertical-align: middle !important;
+    white-space: nowrap !important; overflow: hidden !important; text-overflow: ellipsis !important;
     border-bottom: 1px solid #eef1f5 !important;
-    padding: 2px 4px !important;
 }
-#results-table th .cell-wrap {
-    font-size: 0.8rem !important;
-    font-weight: 600 !important;
+#results-table table td span[title] {cursor: help;}
+#results-table table tbody tr:nth-child(even) td {background: #fbfcfe !important;}
+#results-table table tbody tr:hover td {background: #f8fafc !important;}
+
+#pagination-row {
+    margin-top: 16px; display: flex; align-items: center; justify-content: center; gap: 16px;
 }
-#results-table tbody tr:hover td {
-    background: #f8fafc !important;
-}
-#results-table tbody tr:nth-child(even) td {
-    background: #fbfcfe;
-}
+#pagination-row button {border-radius: 8px !important;}
+#page-indicator {text-align: center; font-size: 0.85rem; color: var(--dash-text-muted); padding-top: 8px;}
+
+#chart-row {margin-top: 20px;}
 """
 
 SEVERITY_NOTE = (
@@ -100,14 +125,16 @@ def _results_to_dataframe(analysis) -> pd.DataFrame:
                 "Category": r.category,
                 "Category Confidence": r.category_confidence,
                 "Category Method": r.category_method,
-                "Description": _truncate(r.description, 60),
-                "Worklog Notes": _truncate(r.worklog, 60),
+                "Short Description": _truncate(r.short_description, 100),
+                "Description": _truncate(r.description, 140),
+                "Worklog Notes": _truncate(r.worklog, 140),
                 "Worklog Score": r.worklog_score,
                 "Worklog Rating": _score_badge(r.worklog_score),
                 "Worklog Flags": "; ".join(r.worklog_flags) if r.worklog_flags else "",
                 "Priority": r.priority or "",
                 "Status": r.status or "",
                 "Assignment Group": r.assignment_group or "",
+                "Validation Notes": "; ".join(r.validation_flags) if r.validation_flags else "",
             }
         )
     return pd.DataFrame(rows)
@@ -300,7 +327,7 @@ def build_ui() -> gr.Blocks:
                     interactive=False,
                     wrap=True,
                     max_height=520,
-                    column_widths=[100, 170, 90, 100, 260, 260, 90, 130, 200, 70, 90, 140],
+                    column_widths=[100, 170, 90, 100, 170, 240, 240, 90, 130, 200, 70, 90, 130, 180],
                     elem_id="results-table",
                 )
 
