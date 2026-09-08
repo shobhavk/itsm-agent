@@ -8,6 +8,7 @@ and avoids needing an API key inside the browser session. The REST API
 use cases, secured with its own API key as usual.
 """
 import io
+import re
 from datetime import datetime
 
 import gradio as gr
@@ -111,8 +112,21 @@ def _score_badge(score: int) -> str:
     return "🔴 Poor"
 
 
-def _truncate(text: str, limit: int) -> str:
+_TAG_RE = re.compile(r"<[^>]+>")
+_WS_RE = re.compile(r"\s+")
+
+
+def _strip_html(text: str) -> str:
+    """Strips HTML tags and collapses whitespace/newlines so table cells
+    render as a single clean line instead of wrapping across many lines."""
     text = text or ""
+    text = _TAG_RE.sub(" ", text)
+    text = _WS_RE.sub(" ", text).strip()
+    return text
+
+
+def _truncate(text: str, limit: int) -> str:
+    text = _strip_html(text)
     return text[:limit] + "…" if len(text) > limit else text
 
 
@@ -325,7 +339,7 @@ def build_ui() -> gr.Blocks:
                 results_table = gr.Dataframe(
                     label="Analyzed Tickets",
                     interactive=False,
-                    wrap=True,
+                    wrap=False,
                     max_height=400,
                     column_widths=[100, 170, 90, 100, 170, 240, 240, 90, 130, 200, 70, 90, 130, 180],
                     elem_id="results-table",
